@@ -19,7 +19,7 @@ from urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 # 🔴 THAY THẾ TOKEN BOT CỦA BẠN VÀO ĐÂY (Lấy từ @BotFather)
-TELEGRAM_BOT_TOKEN = "8918692221:AAEHCnNef9zBR9rFU8VcwWQQ9O-LIPAG8sA"
+TELEGRAM_BOT_TOKEN = "8918692221:AAEP3sI9K_5WBgpFPjtQORsnbmyNMEd06iY"
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
